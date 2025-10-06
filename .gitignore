@@ -1,0 +1,6 @@
+*.csv
+*.png
+temp.py
+__pycache__/
+plots/
+csv/

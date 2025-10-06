@@ -15,6 +15,8 @@ from plot import (
     plot_learning_curve_with_ci,
     plot_skill_trajectories_grid,
 )
+from active_ranking import build_sampling_order
+import math
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -32,7 +34,7 @@ def main():
     # Generate the dataset
     print("Generating dataset...")
     num_players = 8
-    n_matches = 5000
+    n_matches = 2000
     players_df, matches_df = generate_arena_dataset(
         num_players=num_players, n_matches=n_matches, gamma=2, seed=42, allow_ties=True
     )
@@ -70,57 +72,61 @@ def main():
     max_matches = len(matches_df)
     match_counts = range(min_matches, max_matches + 1, step_size)
     
+    order_random = build_sampling_order(matches_df, mode="random", base=math.e, scale=1.0, seed=42)
+    order_active = build_sampling_order(matches_df, mode="active", base=math.e, scale=1.0,
+                                        seed=42, warmup_per_pair=1)
+
+    # Choose which you want to run:
+    ORDER = order_random    # or: order_random
+
     for n_matches in tqdm(match_counts, desc="Computing learning curve"):
-        # Use first n_matches
-        subset_matches = matches_df.head(n_matches)
+        subset_matches = matches_df.loc[ORDER[:n_matches]]
         
         # Compute Elo ratings (single BT fit per step)
-        try:
-            elo_ratings = compute_mle_elo(subset_matches)
-            
-            # Evaluate correlation
-            eval_results = evaluate_ranking_correlation(true_skills, elo_ratings)
-            
-            results.append({
+        
+        elo_ratings = compute_mle_elo(subset_matches)
+        
+        # Evaluate correlation
+        eval_results = evaluate_ranking_correlation(true_skills, elo_ratings)
+        
+        results.append({
+            'n_matches': n_matches,
+            'spearman_correlation': eval_results['spearman_correlation'],
+            'kendall_correlation': eval_results['kendall_correlation'],
+            'spearman_p_value': eval_results['spearman_p_value'],
+            'kendall_p_value': eval_results['kendall_p_value']
+        })
+
+        # Compute CIs in the same loop
+        # Sandwich CI
+        sand = compute_sandwich_ci(subset_matches, elo_ratings)
+        for model, row in sand.iterrows():
+            ci_rows.append({
                 'n_matches': n_matches,
-                'spearman_correlation': eval_results['spearman_correlation'],
-                'kendall_correlation': eval_results['kendall_correlation'],
-                'spearman_p_value': eval_results['spearman_p_value'],
-                'kendall_p_value': eval_results['kendall_p_value']
+                'model': model,
+                'method': 'sandwich',
+                'lower': row['lower'],
+                'rating': row['elo'],
+                'upper': row['upper'],
+                'width': row['upper'] - row['lower'],
+                'true_skill': true_skills.get(model, np.nan),
             })
 
-            # Compute CIs in the same loop
-            # Sandwich CI
-            sand = compute_sandwich_ci(subset_matches, elo_ratings)
-            for model, row in sand.iterrows():
-                ci_rows.append({
-                    'n_matches': n_matches,
-                    'model': model,
-                    'method': 'sandwich',
-                    'lower': row['lower'],
-                    'rating': row['elo'],
-                    'upper': row['upper'],
-                    'width': row['upper'] - row['lower'],
-                    'true_skill': true_skills.get(model, np.nan),
-                })
-
-            # Bootstrap CI (reduced rounds per step for speed)
-            CI_BOOTSTRAP_ROUNDS = 50
-            boot = compute_bootstrap_ci(subset_matches, compute_mle_elo, rounds=CI_BOOTSTRAP_ROUNDS, alpha=0.05)
-            for model, row in boot.iterrows():
-                ci_rows.append({
-                    'n_matches': n_matches,
-                    'model': model,
-                    'method': 'bootstrap',
-                    'lower': row['lower'],
-                    'rating': row['rating'],
-                    'upper': row['upper'],
-                    'width': row['upper'] - row['lower'],
-                    'true_skill': true_skills.get(model, np.nan),
-                })
-        except Exception as e:
-            print(f"Error with {n_matches} matches: {e}")
-            continue
+        # Bootstrap CI (reduced rounds per step for speed)
+        CI_BOOTSTRAP_ROUNDS = 50
+        boot = compute_bootstrap_ci(subset_matches, compute_mle_elo, rounds=CI_BOOTSTRAP_ROUNDS, alpha=0.05)
+        for model, row in boot.iterrows():
+            ci_rows.append({
+                'n_matches': n_matches,
+                'model': model,
+                'method': 'bootstrap',
+                'lower': row['lower'],
+                'rating': row['rating'],
+                'upper': row['upper'],
+                'width': row['upper'] - row['lower'],
+                'true_skill': true_skills.get(model, np.nan),
+            })
+        
     
     learning_curve_df = pd.DataFrame(results)
     ci_df = pd.DataFrame(ci_rows)

@@ -10,16 +10,19 @@ from tqdm import tqdm
 def compute_mle_elo(
     df, SCALE=1, BASE=math.e, INIT_RATING=1000, sample_weight=None
 ):
+    # Ensure all players appear in the matrices to avoid NaNs for missing pairs
+    all_models = sorted(set(df["model_a"]).union(set(df["model_b"])) )
+
     ptbl_a_win = pd.pivot_table(
         df[df["winner"] == "model_a"],
         index="model_a",
         columns="model_b",
         aggfunc="size",
         fill_value=0,
-    )
+    ).reindex(index=all_models, columns=all_models, fill_value=0)
     # if no tie, create a zero matrix
     if sum(df["winner"].isin(["tie", "tie (bothbad)"])) == 0:
-        ptbl_tie = pd.DataFrame(0, index=ptbl_a_win.index, columns=ptbl_a_win.columns)
+        ptbl_tie = pd.DataFrame(0, index=all_models, columns=all_models)
     else:
         ptbl_tie = pd.pivot_table(
             df[df["winner"].isin(["tie", "tie (bothbad)"])],
@@ -27,7 +30,7 @@ def compute_mle_elo(
             columns="model_b",
             aggfunc="size",
             fill_value=0,
-        )
+        ).reindex(index=all_models, columns=all_models, fill_value=0)
         ptbl_tie = ptbl_tie + ptbl_tie.T
 
     ptbl_b_win = pd.pivot_table(
@@ -36,10 +39,10 @@ def compute_mle_elo(
         columns="model_b",
         aggfunc="size",
         fill_value=0,
-    )
+    ).reindex(index=all_models, columns=all_models, fill_value=0)
     ptbl_win = ptbl_a_win * 2 + ptbl_b_win.T * 2 + ptbl_tie
 
-    models = pd.Series(np.arange(len(ptbl_win.index)), index=ptbl_win.index)
+    models = pd.Series(np.arange(len(all_models)), index=all_models)
 
     p = len(models)
     X = np.zeros([p * (p - 1) * 2, p])
@@ -51,21 +54,28 @@ def compute_mle_elo(
         for m_b in ptbl_win.columns:
             if m_a == m_b:
                 continue
-            # if nan skip
-            if math.isnan(ptbl_win.loc[m_a, m_b]) or math.isnan(ptbl_win.loc[m_b, m_a]):
+            w_ab = ptbl_win.loc[m_a, m_b]
+            w_ba = ptbl_win.loc[m_b, m_a]
+            # skip pairs with zero evidence both ways
+            if (w_ab == 0 and w_ba == 0):
                 continue
             X[cur_row, models[m_a]] = +math.log(BASE)
             X[cur_row, models[m_b]] = -math.log(BASE)
             Y[cur_row] = 1.0
-            sample_weights.append(ptbl_win.loc[m_a, m_b])
+            sample_weights.append(w_ab)
 
             X[cur_row + 1, models[m_a]] = math.log(BASE)
             X[cur_row + 1, models[m_b]] = -math.log(BASE)
             Y[cur_row + 1] = 0.0
-            sample_weights.append(ptbl_win.loc[m_b, m_a])
+            sample_weights.append(w_ba)
             cur_row += 2
     X = X[:cur_row]
     Y = Y[:cur_row]
+
+    # Fallback if no rows were generated (e.g., extremely sparse subset)
+    if cur_row == 0:
+        elo_scores = np.zeros(len(models))
+        return pd.Series(elo_scores, index=models.index).sort_values(ascending=False)
 
     lr = LogisticRegression(fit_intercept=False, penalty=None, tol=1e-6)
     lr.fit(X, Y, sample_weight=sample_weights)
