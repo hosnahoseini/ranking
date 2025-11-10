@@ -329,33 +329,33 @@ def main():
         except Exception:
             pass
         # Mean CI-based uncertainty
-        try:
-            fig3, ax3 = plt.subplots(figsize=(6.0, 3.0))
-            steps = dfm['step'].values.astype(int)
-            n_list = dfm['n_matches'].values
-            ax3.plot(steps, dfm['mean_ci_uncertainty'].values, '-o', color='#33a02c')
-            ax3.set_xticks(steps)
-            ax3.set_xticklabels([f"{s} ({int(n) if not pd.isna(n) else 'NA'})" for s, n in zip(steps, n_list)])
-            ax3.set_xlabel('Update step (n_matches)')
-            ax3.set_ylabel('Mean CI-based uncertainty')
-            ax3.grid(True, alpha=0.3)
-            c2.pyplot(fig3, clear_figure=True)
-        except Exception:
-            pass
+        # try:
+        #     fig3, ax3 = plt.subplots(figsize=(6.0, 3.0))
+        #     steps = dfm['step'].values.astype(int)
+        #     n_list = dfm['n_matches'].values
+        #     ax3.plot(steps, dfm['mean_ci_uncertainty'].values, '-o', color='#33a02c')
+        #     ax3.set_xticks(steps)
+        #     ax3.set_xticklabels([f"{s} ({int(n) if not pd.isna(n) else 'NA'})" for s, n in zip(steps, n_list)])
+        #     ax3.set_xlabel('Update step (n_matches)')
+        #     ax3.set_ylabel('Mean CI-based uncertainty')
+        #     ax3.grid(True, alpha=0.3)
+        #     c2.pyplot(fig3, clear_figure=True)
+        # except Exception:
+        #     pass
         # Mean target-specific variance drop
-        try:
-            fig4, ax4 = plt.subplots(figsize=(6.0, 3.0))
-            steps = dfm['step'].values.astype(int)
-            n_list = dfm['n_matches'].values
-            ax4.plot(steps, dfm['mean_target_var_drop'].values, '-o', color='#ff7f00')
-            ax4.set_xticks(steps)
-            ax4.set_xticklabels([f"{s} ({int(n) if not pd.isna(n) else 'NA'})" for s, n in zip(steps, n_list)])
-            ax4.set_xlabel('Update step (n_matches)')
-            ax4.set_ylabel('Mean target variance drop')
-            ax4.grid(True, alpha=0.3)
-            c2.pyplot(fig4, clear_figure=True)
-        except Exception:
-            pass
+        # try:
+        #     fig4, ax4 = plt.subplots(figsize=(6.0, 3.0))
+        #     steps = dfm['step'].values.astype(int)
+        #     n_list = dfm['n_matches'].values
+        #     ax4.plot(steps, dfm['mean_target_var_drop'].values, '-o', color='#ff7f00')
+        #     ax4.set_xticks(steps)
+        #     ax4.set_xticklabels([f"{s} ({int(n) if not pd.isna(n) else 'NA'})" for s, n in zip(steps, n_list)])
+        #     ax4.set_xlabel('Update step (n_matches)')
+        #     ax4.set_ylabel('Mean target variance drop')
+        #     ax4.grid(True, alpha=0.3)
+        #     c2.pyplot(fig4, clear_figure=True)
+        # except Exception:
+        #     pass
 
         # Ranking cube plot using history
         try:
