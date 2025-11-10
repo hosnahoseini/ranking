@@ -4,3 +4,6 @@ temp.py
 __pycache__/
 plots/
 csv/
+analysis_plots/
+error.log
+interactive_ui/snapshots/

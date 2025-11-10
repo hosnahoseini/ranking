@@ -1,248 +1,366 @@
 from scipy.stats import spearmanr, kendalltau
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from itertools import combinations
-from tqdm import tqdm
-from bt import compute_mle_elo
 import math
+from bt import build_bt_design_aggregated
 
 def evaluate_ranking_correlation(true_skills, predicted_ratings):
-
-    # Get common players
-    common_players = true_skills.index.intersection(predicted_ratings.index)
-    true_vals = true_skills[common_players]
-    pred_vals = predicted_ratings[common_players]
-    
-    # Calculate correlations
-    spearman_corr, spearman_p = spearmanr(true_vals, pred_vals)
-    kendall_corr, kendall_p = kendalltau(true_vals, pred_vals)
-    
+    common = true_skills.index.intersection(predicted_ratings.index)
+    s, sp = spearmanr(true_skills[common], predicted_ratings[common])
+    k, kp = kendalltau(true_skills[common], predicted_ratings[common])
     return {
-        'spearman_correlation': spearman_corr,
-        'spearman_p_value': spearman_p,
-        'kendall_correlation': kendall_corr,
-        'kendall_p_value': kendall_p
+        'spearman_correlation': s, 'spearman_p_value': sp,
+        'kendall_correlation': k, 'kendall_p_value': kp
     }
 
 def create_win_matrix(matches_df):
-    
-    
-    # Get unique players
-    players = sorted(set(matches_df['model_a'].unique()) | set(matches_df['model_b'].unique()))
-    
-    # Initialize win matrix
+    players = sorted(set(matches_df['model_a']) | set(matches_df['model_b']))
     win_matrix = pd.DataFrame(0, index=players, columns=players)
-    
-    # Fill in win counts
-    for _, row in matches_df.iterrows():
-        model_a = row['model_a']
-        model_b = row['model_b']
-        winner = row['winner']
-        
-        if winner == 'model_a':
-            win_matrix.loc[model_a, model_b] += 1
-        elif winner == 'model_b':
-            win_matrix.loc[model_b, model_a] += 1
-        # Ties are ignored (0 in matrix)
-    
+    for _, r in matches_df.iterrows():
+        a, b, w = r['model_a'], r['model_b'], r['winner']
+        if w == 'model_a':
+            win_matrix.loc[a, b] += 1
+        elif w == 'model_b':
+            win_matrix.loc[b, a] += 1
     return win_matrix
 
+# --- Sandwich CI, sum-to-zero, returns CI df (compute once per step) ---
+# x = (all possible matches (n 2), )
+# eta and w works
+# write down example 
 
-
-def build_bt_design_aggregated(matches_df, models, base=10.0):
-    """
-    Build pair-aggregated BT design:
-      - two rows per ordered pair (same x): one with y=1 (A beats B), one with y=0 (B beats A)
-      - weights = aggregated counts (wins/ties) exactly as in your compute_mle_elo
-      - ties contribute symmetrically via ptbl_tie + ptbl_tie.T
-    Returns: X (n x p), y (n,), w (n,)
-    """
-    models = list(models)
-    m2i = {m:i for i,m in enumerate(models)}
-    p = len(models)
-    logb = math.log(base)
-
-    # Pivot tables (reindexed so all players appear even if zero)
-    ptbl_a = pd.pivot_table(
-        matches_df[matches_df["winner"] == "model_a"],
-        index="model_a", columns="model_b", aggfunc="size", fill_value=0
-    ).reindex(index=models, columns=models, fill_value=0)
-
-    ptbl_b = pd.pivot_table(
-        matches_df[matches_df["winner"] == "model_b"],
-        index="model_a", columns="model_b", aggfunc="size", fill_value=0
-    ).reindex(index=models, columns=models, fill_value=0)
-
-    if (matches_df["winner"].isin(["tie", "tie (bothbad)"])).any():
-        ptbl_t = pd.pivot_table(
-            matches_df[matches_df["winner"].isin(["tie", "tie (bothbad)"])],
-            index="model_a", columns="model_b", aggfunc="size", fill_value=0
-        ).reindex(index=models, columns=models, fill_value=0)
-        ptbl_t = ptbl_t + ptbl_t.T
-    else:
-        ptbl_t = pd.DataFrame(0, index=models, columns=models)
-
-    # Total "event count" per ordered pair (matches your compute_mle_elo)
-    Wmat = ptbl_a * 2 + ptbl_b.T * 2 + ptbl_t
-
-    rows_X, rows_y, rows_w = [], [], []
-    for a in models:
-        ia = m2i[a]
-        for b in models:
-            if a == b:
-                continue
-            w_ab = float(Wmat.loc[a, b])
-            w_ba = float(Wmat.loc[b, a])
-            if (w_ab == 0 and w_ba == 0) or np.isnan(w_ab) or np.isnan(w_ba):
-                continue
-
-            # Same feature vector for both rows (logit is linear in rating diff)
-            x = np.zeros(p, dtype=float)
-            x[ia] = +logb
-            x[m2i[b]] = -logb
-
-            # Row for "A beats B"
-            rows_X.append(x)
-            rows_y.append(1.0)
-            rows_w.append(w_ab)
-
-            # Row for "B beats A"
-            rows_X.append(x)
-            rows_y.append(0.0)
-            rows_w.append(w_ba)
-
-    if not rows_X:
-        raise ValueError("Empty design: no pair data after aggregation.")
-
-    X = np.vstack(rows_X)              # (n, p)
-    y = np.asarray(rows_y, dtype=float)
-    w = np.asarray(rows_w, dtype=float)
-    return X, y, w
-
-
-# ---------- main: sandwich CI with SUM-TO-ZERO (no ref dropped) ----------
 def compute_sandwich_ci(matches_df, elo_series, scale=1.0, base=math.e, ridge=1e-8):
-    """
-    Huber–White (sandwich) robust CIs for Elo/BT with sum-to-zero identifiability.
-    - Uses the SAME aggregated design & weights as your fit.
-    - Enforces identifiability with a contrast basis Q where Q^T 1 = 0 (sum-to-zero).
-    - Returns 95% CIs on Elo scale for all players (no zero-width CI).
-    """
-    # Ensure order matches the fitted ratings
     models = list(elo_series.index)
-
-    # Build design identical to the fit
     X, y, w = build_bt_design_aggregated(matches_df, models, base=base)
     p = X.shape[1]
 
-    # Parameters on logistic scale: elo = scale*beta + 1000 => beta = (elo-1000)/scale
-    beta_full = (elo_series.values + 0.5) / scale
+    # xi = scale*beta + 0.5  =>  beta = (xi - 0.5)/scale
+    beta_full = (elo_series.values - 0.5) / scale
 
-    # Predicted probabilities
     eta = X @ beta_full
-    # numerically stable sigmoid
     p_hat = 1.0 / (1.0 + np.exp(-np.clip(eta, -30, 30)))
 
-    # -------- sum-to-zero contrast basis Q (p x (p-1)) --------
-    # Columns of Q span the subspace orthogonal to ones: Q^T 1 = 0, and Q^T Q = I
+    # contrast basis Q (sum-to-zero)
     A = np.ones((1, p), dtype=float)
-    # SVD of A gives first right-singular vector ~ normalized ones; the rest span the contrast subspace
     U, S, Vt = np.linalg.svd(A, full_matrices=True)
-    Q = Vt[1:, :].T   # shape: (p, p-1)
+    Q = Vt[1:, :].T
+    Xr = X @ Q
 
-    # Project design into contrast coordinates
-    Xr = X @ Q          # (n, p-1)
-
-    # -------- Sandwich pieces (with aggregated weights) --------
-    # Bread: Xr^T diag(w * p*(1-p)) Xr
+    # Bread: Xr^T diag(w p(1-p)) Xr
     W_diag = w * p_hat * (1.0 - p_hat)
     Bread = (Xr.T * W_diag) @ Xr
 
-    # Meat: Xr^T diag((w * (y - p))^2) Xr
+    # Meat: Xr^T diag(w * r^2) Xr
     r = y - p_hat
-    Meat = (Xr.T * (w * (r**2))) @ Xr  # = Xr^T diag(w * r^2) Xr
+    Meat = (Xr.T * (w * (r**2))) @ Xr
 
-
-    # Invert (use pinv + tiny ridge for stability)
     Binv = np.linalg.pinv(Bread + ridge * np.eye(Bread.shape[0]))
-    Cov_r = Binv @ Meat @ Binv       # covariance in contrast coords (p-1 x p-1)
+    Cov_r = Binv @ Meat @ Binv
+    Cov_beta = Q @ Cov_r @ Q.T  # rank p-1 (expected)
 
-    # Map back to full p-dim parameter space (rank p-1; singular by construction)
-    Cov_full_beta = Q @ Cov_r @ Q.T  # (p x p)
+    se_beta = np.sqrt(np.clip(np.diag(Cov_beta), 0.0, None))
+    se_elo = se_beta * scale
 
-    # Standard errors on Elo scale
-    se_beta = np.sqrt(np.clip(np.diag(Cov_full_beta), 0.0, None))
-    se_elo  = se_beta * scale
-
-    # 95% CIs
     z = 1.96
     elo = elo_series.values
     lower = elo - z * se_elo
     upper = elo + z * se_elo
+    out = pd.DataFrame({"elo": elo, "se_elo": se_elo, "lower": lower, "upper": upper}, index=models)
+    active_info_state = {
+        "models": models,
+        "elo": elo,
+        "Q": Q,
+        "Bread": Bread,
+        "Binv": Binv,
+        "Cov_beta": Cov_beta,
+        "p_hat": p_hat,
+        "X": X,
+        "y": y,
+        "w": w
+    }
+    return out.loc[elo_series.index], active_info_state
 
-    out = pd.DataFrame(
-        {"elo": elo, "se_elo": se_elo, "lower": lower, "upper": upper},
-        index=models
-    )
-    return out.loc[elo_series.index]
-
+# --- Bootstrap CI (unchanged) ---
 def compute_bootstrap_ci(matches_df, compute_fn, rounds=200, alpha=0.05, random_state=42):
     rng = np.random.default_rng(random_state)
     all_models = sorted(set(matches_df["model_a"])|set(matches_df["model_b"]))
     samples = []
-    for _ in tqdm(range(rounds), desc="bootstrap"):
-        boot_df = matches_df.sample(frac=1.0, replace=True,
-                                    random_state=int(rng.integers(0, 1e9)))
-        s = compute_fn(boot_df).reindex(all_models)
+    for _ in range(rounds):
+        boot = matches_df.sample(frac=1.0, replace=True,
+                                 random_state=int(rng.integers(0, 1e9)))
+        s = compute_fn(boot).reindex(all_models)
         samples.append(s)
     S = pd.DataFrame(samples, columns=all_models)
-    Q = S.quantile([alpha/2, 0.5, 1-alpha/2])
-    return pd.DataFrame({"lower": Q.loc[alpha/2], "rating": Q.loc[0.5], "upper": Q.loc[1-alpha/2]})
+    Qq = S.quantile([alpha/2, 0.5, 1-alpha/2])
+    return pd.DataFrame({"lower": Qq.loc[alpha/2], "rating": Qq.loc[0.5], "upper": Qq.loc[1-alpha/2]})
+    
 
-
-def ci_learning_curve(matches_df, players_df, step_size=100, min_matches=100, rounds=200, alpha=0.05):
+def compute_log_likelihood(matches_df, elo_series, base=math.e) -> float:
     """
-    Build CI curves (sandwich and bootstrap widths) vs number of matches for each model.
-    Returns a long-form DataFrame with columns: n_matches, model, method, lower, rating, upper, width
+    Compute the (weighted) log-likelihood of the BT logistic model given matches_df and elo ratings.
+    Uses the aggregated design to align with training.
     """
-    true_skills = players_df.set_index('player_name')['skill_level']
-    results = []
-    max_matches = len(matches_df)
-    match_counts = range(min_matches, max_matches + 1, step_size)
+    models = list(elo_series.index)
+    X, y, w = build_bt_design_aggregated(matches_df, models, base=base)
+    # elo = scale*beta + 0.5 with scale=1.0 in current convention => beta = elo - 0.5
+    beta_full = (elo_series.reindex(models).values - 0.5)
+    eta = X @ beta_full
+    # Stabilize probabilities
+    eta = np.clip(eta, -30, 30)
+    p = 1.0 / (1.0 + np.exp(-eta))
+    eps = 1e-12
+    logp = np.log(np.clip(p, eps, 1 - eps))
+    log1mp = np.log(np.clip(1.0 - p, eps, 1 - eps))
+    ll = float(np.sum(w * (y * logp + (1.0 - y) * log1mp)))
+    return ll
 
-    for n_matches in tqdm(match_counts, desc="CI curve"):
-        subset = matches_df.head(n_matches)
-        elo_series = compute_mle_elo(subset)
 
-        # Sandwich CI
-        sand = compute_sandwich_ci(subset, elo_series)
-        for model, row in sand.iterrows():
-            results.append({
-                "n_matches": n_matches,
-                "model": model,
-                "method": "sandwich",
-                "lower": row["lower"],
-                "rating": row["elo"],
-                "upper": row["upper"],
-                "width": row["upper"] - row["lower"],
-                "true_skill": true_skills.get(model, np.nan),
-            })
+def compute_elo_add_reward(
+    elo_series: pd.Series,
+    model_a: str,
+    model_b: str,
+    target_model: str,
+    K: float = 1.0,
+    SCALE: float = 1.0,
+    BASE: float = math.e,
+) -> float:
+    """
+    Hypothetical reward if we add one match where model_a wins over model_b.
+    Using the user's provided update logic on Elo-like ratings (elo_series):
+      - ra, rb from elo_series
+      - ea, eb computed from BASE and SCALE
+      - update ra1, rb1 with step size K and eb
+      - reward = P(target loses to updated A) + P(target loses to updated B)
+                = 1/(1+BASE^((ra1-rt)/SCALE)) + 1/(1+BASE^((rb1-rt)/SCALE))
+    """
+    initial_rating = elo_series.to_dict()
+    if model_a not in initial_rating or model_b not in initial_rating or target_model not in initial_rating:
+        return float('nan')
+    ra = float(initial_rating[model_a])
+    rb = float(initial_rating[model_b])
+    rt = float(initial_rating[target_model])
 
-        # Bootstrap CI
-        boot = compute_bootstrap_ci(subset, compute_mle_elo, rounds=rounds, alpha=alpha)
-        for model, row in boot.iterrows():
-            results.append({
-                "n_matches": n_matches,
-                "model": model,
-                "method": "bootstrap",
-                "lower": row["lower"],
-                "rating": row["rating"],
-                "upper": row["upper"],
-                "width": row["upper"] - row["lower"],
-                "true_skill": true_skills.get(model, np.nan),
-            })
+    ea = 1.0 / (1.0 + (BASE ** ((rb - ra) / SCALE)))
+    eb = 1.0 / (1.0 + (BASE ** ((ra - rb) / SCALE)))
 
-    return pd.DataFrame(results)
+    ra1 = ra + K * eb
+    rb1 = rb - K * eb
 
+    term_a = 1.0 / (1.0 + (BASE ** ((ra1 - rt) / SCALE)))
+    term_b = 1.0 / (1.0 + (BASE ** ((rb1 - rt) / SCALE)))
+    reward = float(term_a + term_b)
+    return reward
+
+
+def compute_elo_add_reward_actual(
+    elo_series: pd.Series,
+    model_a: str,
+    model_b: str,
+    winner: str,
+    target_model: str,
+    K: float = 1.0,
+    SCALE: float = 1.0,
+    BASE: float = math.e,
+) -> float:
+    """
+    Reward using the actual match outcome in `winner`:
+      - winner in {"model_a", "model_b", "tie", "tie (bothbad)"}
+      - Updates (ra, rb) according to the outcome, then computes:
+        1/(1+BASE^((ra1-rt)/SCALE)) + 1/(1+BASE^((rb1-rt)/SCALE))
+      - Ties default to no rating change (ra1=ra, rb1=rb)
+    """
+    initial_rating = elo_series.to_dict()
+    if model_a not in initial_rating or model_b not in initial_rating or target_model not in initial_rating:
+        return float('nan')
+    ra = float(initial_rating[model_a])
+    rb = float(initial_rating[model_b])
+    rt = float(initial_rating[target_model])
+
+    ea = 1.0 / (1.0 + (BASE ** ((rb - ra) / SCALE)))
+    eb = 1.0 / (1.0 + (BASE ** ((ra - rb) / SCALE)))
+
+    w = str(winner).lower().strip()
+    if w in ("model_a", "a"):
+        ra1 = ra + K * eb
+        rb1 = rb - K * eb
+    elif w in ("model_b", "b"):
+        rb1 = rb + K * ea
+        ra1 = ra - K * ea
+    elif w in ("tie", "tie (bothbad)"):
+        ra1, rb1 = ra, rb
+    else:
+        return float('nan')
+
+    term_a = 1.0 / (1.0 + (BASE ** ((ra1 - rt) / SCALE)))
+    term_b = 1.0 / (1.0 + (BASE ** ((rb1 - rt) / SCALE)))
+    return float(term_a + term_b)
+
+
+def compute_reward_per_match(matches_df: pd.DataFrame, elo_series: pd.Series, target_player: str | None) -> pd.Series:
+    vals = []
+    for _, r in matches_df.iterrows():
+        a = r['model_a']; b = r['model_b']; w = r['winner']
+        if target_player is not None:
+            tgt = target_player
+            val = compute_elo_add_reward_actual(elo_series, a, b, w, tgt)
+        else:
+            if w == 'model_a':
+                tgt = a
+                val = compute_elo_add_reward_actual(elo_series, a, b, w, tgt)
+            elif w == 'model_b':
+                tgt = b
+                val = compute_elo_add_reward_actual(elo_series, a, b, w, tgt)
+            else:
+                r1 = compute_elo_add_reward_actual(elo_series, a, b, w, a)
+                r2 = compute_elo_add_reward_actual(elo_series, a, b, w, b)
+                val = float(np.nanmean([r1, r2]))
+        vals.append(val)
+    return pd.Series(vals, index=matches_df.index, name='reward')
+
+
+def compute_ci_pair_scores(current_df: pd.DataFrame, elo_series: pd.Series) -> dict:
+    """
+    Pair-level 'uncertainty' score based on CI geometry:
+      score(a,b) = sqrt(v_ij)                              if N_ij == 0
+                 = sqrt(v_ij) * (1/sqrt(N_ij) - 1/sqrt(N_ij+1)) otherwise
+      where v_ij = Var(beta_i - beta_j) from Cov_beta (sandwich),
+            N_ij = number of existing matches between unordered pair {a,b} in current_df.
+    Returns a dict keyed by ordered tuple (min(a,b), max(a,b)) -> float score.
+    """
+    # CI info under current dataset/state
+    _, info = compute_sandwich_ci(current_df, elo_series, base=math.e)
+    Cov = info["Cov_beta"]
+    models = info["models"]
+    m2i = {m: i for i, m in enumerate(models)}
+
+    # Unordered pair counts from current_df
+    def _pair_key(x, y):
+        return (x, y) if str(x) <= str(y) else (y, x)
+    pair_counts = {}
+    for _, r in current_df.iterrows():
+        a, b = r["model_a"], r["model_b"]
+        key = _pair_key(a, b)
+        pair_counts[key] = pair_counts.get(key, 0) + 1
+
+    pair_scores = {}
+    for i, a in enumerate(models):
+        for j, b in enumerate(models):
+            if i >= j:
+                continue
+            v_ij = float(Cov[i, i] + Cov[j, j] - 2.0 * Cov[i, j])
+            v_ij = max(v_ij, 1e-12)
+            key = _pair_key(a, b)
+            N_ij = int(pair_counts.get(key, 0))
+            if N_ij <= 0:
+                score = float(np.sqrt(v_ij))
+            else:
+                score = float(np.sqrt(v_ij) * ((1.0 / np.sqrt(N_ij)) - (1.0 / np.sqrt(N_ij + 1.0))))
+            pair_scores[key] = score
+    return pair_scores
+
+
+def compute_ci_uncertainty_per_match(matches_df: pd.DataFrame, elo_series: pd.Series) -> pd.Series:
+    """
+    Map the CI-based pair scores (under matches_df) to each match row.
+    All matches of the same unordered pair share the same score.
+    """
+    pair_scores = compute_ci_pair_scores(matches_df, elo_series)
+    def _pair_key(x, y):
+        return (x, y) if str(x) <= str(y) else (y, x)
+    vals = []
+    for _, r in matches_df.iterrows():
+        a, b = r["model_a"], r["model_b"]
+        vals.append(pair_scores.get(_pair_key(a, b), np.nan))
+    return pd.Series(vals, index=matches_df.index, name="ci_uncertainty")
+
+
+def compute_target_variance_drop_pair_scores(
+    matches_df: pd.DataFrame,
+    elo_series: pd.Series,
+    target_player: str,
+    base: float = math.e,
+    alpha_mode: str = "fixed",
+) -> dict:
+    """
+    Target-specific variance drop score for each unordered pair (mi, mj), inspired by run.py (254-281).
+      - Uses compute_sandwich_ci => obtains Q (contrast basis) and Binv (inverse bread)
+      - For target 'a': e_full[a]=1 projects to e_r = Q^T e_full
+      - For each pair (mi, mj):
+          x_full has +log(base) on mi, -log(base) on mj; x_r = Q^T x_full
+          s1 = x_r^T Binv x_r
+          s2 = e_r^T Binv x_r
+          alpha ≈ q*(1-q); we default to 0.25 when alpha_mode='fixed'
+          delta_var_a = (alpha * s2^2) / (1 + alpha * s1)
+    Returns dict with keys (min(mi,mj), max(mi,mj)) -> delta_var_a (float).
+    """
+    # CI info under current dataset/state
+    _, info = compute_sandwich_ci(matches_df, elo_series, base=base)
+    models = info["models"]
+    Q = info["Q"]
+    Binv = info["Binv"]
+    m2i = {m: i for i, m in enumerate(models)}
+    if target_player not in m2i:
+        return {}
+
+    logb = math.log(base)
+
+    def _pair_key(x, y):
+        return (x, y) if str(x) <= str(y) else (y, x)
+
+    # Build e_r for target
+    p = len(models)
+    e_full = np.zeros(p, dtype=float)
+    e_full[m2i[target_player]] = 1.0
+    e_r = Q.T @ e_full  # (p-1,)
+
+    # Optional pair counts (to filter to present pairs); use unordered pairs present in df
+    present_pairs = set()
+    for _, r in matches_df.iterrows():
+        present_pairs.add(_pair_key(r["model_a"], r["model_b"]))
+
+    scores = {}
+    for i, mi in enumerate(models):
+        for j in range(i + 1, len(models)):
+            mj = models[j]
+            key = _pair_key(mi, mj)
+            if key not in present_pairs:
+                # skip pairs not present in current dataset
+                continue
+            x_full = np.zeros(p, dtype=float)
+            x_full[m2i[mi]] = +logb
+            x_full[m2i[mj]] = -logb
+            x_r = Q.T @ x_full
+            s1 = float(x_r.T @ Binv @ x_r)
+            s2 = float(e_r.T @ Binv @ x_r)
+            if alpha_mode == "model":
+                # Use current elo to estimate q for pair (mi over mj)
+                di = float(elo_series.get(mi, 0.5))
+                dj = float(elo_series.get(mj, 0.5))
+                eta = np.clip((di - dj), -30, 30)
+                q = 1.0 / (1.0 + np.exp(-eta))
+                alpha = float(q * (1.0 - q))
+            else:
+                alpha = 0.25
+            delta_var = (alpha * (s2 ** 2.0)) / (1.0 + alpha * s1)
+            scores[key] = float(delta_var)
+    return scores
+
+
+def compute_target_variance_drop_per_match(
+    matches_df: pd.DataFrame,
+    elo_series: pd.Series,
+    target_player: str,
+    base: float = math.e,
+    alpha_mode: str = "fixed",
+) -> pd.Series:
+    """
+    Map target-specific variance drop scores to each match row by its unordered pair.
+    """
+    pair_scores = compute_target_variance_drop_pair_scores(matches_df, elo_series, target_player, base=base, alpha_mode=alpha_mode)
+    def _pair_key(x, y):
+        return (x, y) if str(x) <= str(y) else (y, x)
+    vals = []
+    for _, r in matches_df.iterrows():
+        a, b = r["model_a"], r["model_b"]
+        vals.append(pair_scores.get(_pair_key(a, b), np.nan))
+    return pd.Series(vals, index=matches_df.index, name=f"target_var_drop[{target_player}]")

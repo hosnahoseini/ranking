@@ -4,7 +4,7 @@ import pandas as pd
 
 def generate_bt_coeffs(num_players=20, gamma=2, seed=0):
     """Generate player skill coefficients (BT parameters)."""
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(42)
     xi = rng.beta(1/gamma, 1/gamma, size=num_players)
     return xi
 
