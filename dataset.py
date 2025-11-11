@@ -12,7 +12,7 @@ def simulate_match(xi, m, m_prime, rng=None, allow_ties=False):
     """Simulate one match outcome between players m and m_prime."""
     if rng is None:
         rng = np.random.default_rng()
-    p_win = 1 / (1 + np.exp(xi[m] - xi[m_prime]))
+    p_win = 1 / (1 + np.exp(xi[m_prime] - xi[m]))
     r = rng.random()
     if allow_ties:
         # Simple tie model: 10% chance of tie, otherwise BT
@@ -44,13 +44,13 @@ def generate_arena_dataset(num_players=10, n_matches=1000, gamma=2, seed=0, allo
             data.append({
                 "model_a": f"Player_{m}",
                 "model_b": f"Player_{m_prime}",
-                "winner": "model_a"
+                "winner": "model_b"
             })
         else:  # outcome == "m_prime"
             data.append({
                 "model_a": f"Player_{m}",
                 "model_b": f"Player_{m_prime}",
-                "winner": "model_b"
+                "winner": "model_a"
             })
 
     players_df = pd.DataFrame({
