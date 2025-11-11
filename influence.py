@@ -10,12 +10,16 @@ def run_logistic_regression(
     y: np.ndarray,
     fit_intercept: bool = False,
     penalty: str = None,
+    sample_weight: np.ndarray | None = None,
 ) -> LogisticRegression:
     """
     Fit a logistic regression model.
     """
     model = LogisticRegression(fit_intercept=fit_intercept, penalty=penalty)
-    model.fit(X, y)
+    if sample_weight is not None:
+        model.fit(X, y, sample_weight=sample_weight)
+    else:
+        model.fit(X, y)
     return model
 
 def find_closest_matchups(player_scores: np.ndarray, k: int) -> 'list[tuple[int,int,float]]':
@@ -76,7 +80,8 @@ def isRankingRobust(k, alphaN, X, y):
 class LogisticAMIP():
     def __init__(self, X: np.ndarray, y: np.ndarray, 
                  fit_intercept: bool = False, 
-                 penalty: str = None
+                 penalty: str = None,
+                 sample_weight: np.ndarray | None = None
                  ):
         '''
         Class for dealing with AMIP in logistic regression
@@ -91,7 +96,8 @@ class LogisticAMIP():
         self.y = y
         self.fit_intercept = fit_intercept
         self.penalty = penalty
-        self.model = run_logistic_regression(X, y, fit_intercept, penalty)
+        self.sample_weight = sample_weight
+        self.model = run_logistic_regression(X, y, fit_intercept, penalty, sample_weight=sample_weight)
         self.pos_p_hats = self.model.predict_proba(X)[:, 1]
 
         ### private stuff ###
@@ -101,7 +107,11 @@ class LogisticAMIP():
         self.__p__ = X.shape[1]
         
 
-        self.__v__ = self.pos_p_hats * (1 - self.pos_p_hats) # (n,)
+        # Per-row variance factor v = w * p(1-p) if weights provided
+        if self.sample_weight is not None:
+            self.__v__ = self.sample_weight * (self.pos_p_hats * (1 - self.pos_p_hats))
+        else:
+            self.__v__ = self.pos_p_hats * (1 - self.pos_p_hats) # (n,)
 
         H = X.T @ (self.__v__[:, None] * X)  # (p, p)
         self.__invH__ = np.linalg.pinv(H)    # safe pseudo-inverse
@@ -231,21 +241,18 @@ class LogisticAMIP():
 
 
 def compute_leverage(
-    pos_p_hats: np.ndarray,
+    v_vec: np.ndarray,
     X: np.ndarray,
     index: int,
-    y: np.ndarray,
 ) -> float:
     """
-    pos_p_hats: np.array, shape (n,), the predicted probabilities.
+    v_vec: np.array, shape (n,), the per-row variance multiplier (optionally weighted).
     X: np.array, shape (n, p), the design matrix.
     index: int, the index of the data point whose influence we want to compute.
-    y: np.array, shape (n,), the response variable.
 
     Compute the leverage of the index-th data point.
     """
-    v_lst = pos_p_hats * (1 - pos_p_hats)
-    V = np.diag(v_lst)
+    V = np.diag(v_vec)
     H = V @ X @ np.linalg.pinv(X.T @ V @ X) @ X.T
     return H[index, index]
 
@@ -270,17 +277,18 @@ def compute_influence_leverage(matches_df: pd.DataFrame, elo_series: pd.Series) 
     if non_tie_df.empty:
         return pd.Series(np.nan, index=matches_df.index, name="influence_leverage")
     try:
-        X, y, _ = build_bt_design_aggregated(non_tie_df, models_order, base=math.e)
+        X, y, w = build_bt_design_aggregated(non_tie_df, models_order, base=math.e)
     except Exception:
         # If aggregated design cannot be built (e.g., no pair data), return NaNs
         return pd.Series(np.nan, index=matches_df.index, name="influence_leverage")
 
     # --- Step 3: Fit logistic regression using AMIP ---
-    amip = LogisticAMIP(X, y, fit_intercept=False, penalty=None)
+    amip = LogisticAMIP(X, y, fit_intercept=False, penalty=None, sample_weight=w)
     pos_p_hats = amip.get_pos_p_hats()
 
     # --- Step 4: Compute leverage per aggregated non-tie row ---
-    leverages = np.array([compute_leverage(pos_p_hats, X, i, y) for i in range(X.shape[0])])
+    v_vec = (w * (pos_p_hats * (1 - pos_p_hats))).astype(float)
+    leverages = np.array([compute_leverage(v_vec, X, i) for i in range(X.shape[0])])
 
     # --- Step 5: Map aggregated leverages back to non-tie matches robustly ---
     # Build label list for each aggregated row: (a,b,'model_a') for y=1; (a,b,'model_b') for y=0
