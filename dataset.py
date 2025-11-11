@@ -12,7 +12,7 @@ def simulate_match(xi, m, m_prime, rng=None, allow_ties=False):
     """Simulate one match outcome between players m and m_prime."""
     if rng is None:
         rng = np.random.default_rng()
-    p_win = 1 / (1 + np.exp(xi[m_prime] - xi[m]))
+    p_win = 1 / (1 + np.exp(xi[m] - xi[m_prime]))
     r = rng.random()
     if allow_ties:
         # Simple tie model: 10% chance of tie, otherwise BT
