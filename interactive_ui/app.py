@@ -38,7 +38,7 @@ def _ensure_session_state_defaults():
 
 
 
-def fit_bt_and_metrics(matches_df: pd.DataFrame, players_df: pd.DataFrame, target_player: str | None):
+def fit_bt_and_metrics(matches_df: pd.DataFrame, players_df: pd.DataFrame, target_player: str | None, full_matches_df: pd.DataFrame | None = None):
     elo = compute_mle_elo(matches_df)
     sand, _ = compute_sandwich_ci(matches_df, elo)
     true_skills = players_df.set_index('player_name')['skill_level'] if 'player_name' in players_df.columns else None
@@ -55,7 +55,29 @@ def fit_bt_and_metrics(matches_df: pd.DataFrame, players_df: pd.DataFrame, targe
         target_var_drop = compute_target_variance_drop_per_match(matches_df, elo, tv_target)
     else:
         target_var_drop = pd.Series(np.nan, index=matches_df.index, name="target_var_drop")
-    return elo, sand, true_skills, reward, influence, ci_unc, target_var_drop
+    # Optionally compute "all matches" metrics using the same elo
+    all_metrics = {}
+    if full_matches_df is not None:
+        try:
+            all_metrics['reward_all'] = compute_reward_per_match(full_matches_df, elo, target_player)
+        except Exception:
+            all_metrics['reward_all'] = pd.Series(np.nan, index=full_matches_df.index, name='reward')
+        try:
+            all_metrics['influence_all'] = compute_influence_leverage(full_matches_df, elo)
+        except Exception:
+            all_metrics['influence_all'] = pd.Series(np.nan, index=full_matches_df.index, name='influence')
+        try:
+            all_metrics['ci_unc_all'] = compute_ci_uncertainty_per_match(full_matches_df, elo)
+        except Exception:
+            all_metrics['ci_unc_all'] = pd.Series(np.nan, index=full_matches_df.index, name='ci_uncertainty')
+        try:
+            if tv_target:
+                all_metrics['target_var_drop_all'] = compute_target_variance_drop_per_match(full_matches_df, elo, tv_target)
+            else:
+                all_metrics['target_var_drop_all'] = pd.Series(np.nan, index=full_matches_df.index, name='target_var_drop')
+        except Exception:
+            all_metrics['target_var_drop_all'] = pd.Series(np.nan, index=full_matches_df.index, name='target_var_drop')
+    return elo, sand, true_skills, reward, influence, ci_unc, target_var_drop, all_metrics
 
 
 def build_players_table(elo: pd.Series, ci_df: pd.DataFrame, true_skills: pd.Series | None) -> pd.DataFrame:
@@ -105,7 +127,7 @@ def main():
         st.session_state.matches_df = matches_df
         st.session_state.subset_indices = matches_df.index.tolist()  # default all selected
         # Base ranking on full dataset
-        base_elo, _, _, _, _, _, _ = fit_bt_and_metrics(matches_df, players_df, target_player=None)
+        base_elo, _, _, _, _, _, _, _ = fit_bt_and_metrics(matches_df, players_df, target_player=None, full_matches_df=matches_df)
         st.session_state.base_elo = base_elo
         st.session_state.target_player = target_player
 
@@ -165,20 +187,11 @@ def main():
         st.session_state.subset_indices = sel
     if cr_fit.button("Fit BT on selected matches"):
         subset = matches_df.loc[st.session_state.subset_indices]
-        elo, ci_df, true_skills, reward_series, influence_series, ci_unc_series, tvd_series = fit_bt_and_metrics(subset, players_df, target_player)
-        reward_all = compute_reward_per_match(matches_df, elo, target_player)
-        influence_all = compute_influence_leverage(matches_df, elo)
-        ci_unc_all = compute_ci_uncertainty_per_match(matches_df, elo)
-        # target var drop across all matches using provided target or leader
-        try:
-            leader = pd.Series(elo).sort_values(ascending=False).index[0]
-        except Exception:
-            leader = None
-        tv_target = target_player if target_player else leader
-        if tv_target:
-            tvd_all = compute_target_variance_drop_per_match(matches_df, elo, tv_target)
-        else:
-            tvd_all = pd.Series(np.nan, index=matches_df.index, name="target_var_drop")
+        elo, ci_df, true_skills, reward_series, influence_series, ci_unc_series, tvd_series, all_metrics = fit_bt_and_metrics(subset, players_df, target_player, full_matches_df=matches_df)
+        reward_all = all_metrics.get('reward_all')
+        influence_all = all_metrics.get('influence_all')
+        ci_unc_all = all_metrics.get('ci_unc_all')
+        tvd_all = all_metrics.get('target_var_drop_all')
         hist_item = {
             'step': len(st.session_state.history),
             'elo': elo,

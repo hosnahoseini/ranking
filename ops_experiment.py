@@ -115,7 +115,7 @@ def _min_actions_to_change(
     assert change_mode in {"any", "player"}
 
     players_df, matches_df = generate_arena_dataset(
-        num_players=num_players, n_matches=n_matches, gamma=2, seed=1, allow_ties=True
+        num_players=num_players, n_matches=n_matches, gamma=2, seed=seed, allow_ties=True
     )
 
     rng = np.random.default_rng(seed)

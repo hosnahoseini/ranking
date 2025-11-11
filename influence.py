@@ -266,7 +266,14 @@ def compute_influence_leverage(matches_df: pd.DataFrame, elo_series: pd.Series) 
 
     # --- Step 2: Build BT design for non-tie matches ---
     models_order = list(elo_series.index)
-    X, y, _ = build_bt_design_aggregated(non_tie_df, models_order, base=math.e)
+    # Guard: if there are no non-tie rows, return NaNs aligned to matches_df
+    if non_tie_df.empty:
+        return pd.Series(np.nan, index=matches_df.index, name="influence_leverage")
+    try:
+        X, y, _ = build_bt_design_aggregated(non_tie_df, models_order, base=math.e)
+    except Exception:
+        # If aggregated design cannot be built (e.g., no pair data), return NaNs
+        return pd.Series(np.nan, index=matches_df.index, name="influence_leverage")
 
     # --- Step 3: Fit logistic regression using AMIP ---
     amip = LogisticAMIP(X, y, fit_intercept=False, penalty=None)
@@ -275,27 +282,36 @@ def compute_influence_leverage(matches_df: pd.DataFrame, elo_series: pd.Series) 
     # --- Step 4: Compute leverage per aggregated non-tie row ---
     leverages = np.array([compute_leverage(pos_p_hats, X, i, y) for i in range(X.shape[0])])
 
-    # --- Step 5: Map aggregated leverages back to non-tie matches ---
-    aggr_keys = (
-        non_tie_df.groupby(["model_a", "model_b", "winner"])
-        .ngroup()
-        .to_numpy()
-    )
-    unique_keys, inverse_idx = np.unique(aggr_keys, return_inverse=True)
+    # --- Step 5: Map aggregated leverages back to non-tie matches robustly ---
+    # Build label list for each aggregated row: (a,b,'model_a') for y=1; (a,b,'model_b') for y=0
+    lbls = []
+    for i in range(X.shape[0]):
+        row = X[i]
+        pos = np.where(np.abs(row) > 0)[0]
+        if len(pos) == 2:
+            ia, ib = pos[0], pos[1]
+            va = row[ia]
+            a = models_order[ia] if va > 0 else models_order[ib]
+            b = models_order[ib] if va > 0 else models_order[ia]
+            outcome = 'model_a' if y[i] == 1.0 else 'model_b'
+            lbls.append((a, b, outcome))
+        else:
+            lbls.append((None, None, None))
+    infl_map = {}
+    for i, key in enumerate(lbls):
+        infl_map[key] = float(leverages[i])
 
-    if len(leverages) != len(unique_keys):
-        min_len = min(len(leverages), len(unique_keys))
-        leverages = leverages[:min_len]
-        unique_keys = unique_keys[:min_len]
-
-    non_tie_df["influence_leverage"] = leverages[inverse_idx[: len(non_tie_df)]]
+    # Assign per non-tie match directly via map
+    non_tie_df["influence_leverage"] = np.nan
+    for idx, r in non_tie_df.iterrows():
+        a, b, w = r["model_a"], r["model_b"], r["winner"]
+        non_tie_df.at[idx, "influence_leverage"] = infl_map.get((a, b, w), np.nan)
 
     # --- Step 6: Handle tie matches (average both outcomes) ---
     if not tie_df.empty:
         tie_df["influence_leverage"] = np.nan
         for i, row in tie_df.iterrows():
             a, b = row["model_a"], row["model_b"]
-
             # Get influence when model_a wins
             val_a = non_tie_df.loc[
                 (non_tie_df["model_a"] == a)
@@ -303,7 +319,6 @@ def compute_influence_leverage(matches_df: pd.DataFrame, elo_series: pd.Series) 
                 & (non_tie_df["winner"] == "model_a"),
                 "influence_leverage",
             ]
-
             # Get influence when model_b wins
             val_b = non_tie_df.loc[
                 (non_tie_df["model_a"] == a)
@@ -311,12 +326,15 @@ def compute_influence_leverage(matches_df: pd.DataFrame, elo_series: pd.Series) 
                 & (non_tie_df["winner"] == "model_b"),
                 "influence_leverage",
             ]
-
-            # Average both if available
-            avg_val = np.nanmean([
-                val_a.mean() if not val_a.empty else np.nan,
-                val_b.mean() if not val_b.empty else np.nan,
-            ])
+            # Average both if available, avoid RuntimeWarning when both empty
+            if not val_a.empty and not val_b.empty:
+                avg_val = float((val_a.mean() + val_b.mean()) / 2.0)
+            elif not val_a.empty:
+                avg_val = float(val_a.mean())
+            elif not val_b.empty:
+                avg_val = float(val_b.mean())
+            else:
+                avg_val = np.nan
             tie_df.at[i, "influence_leverage"] = avg_val
 
     # --- Step 7: Merge back to full matches_df order ---
