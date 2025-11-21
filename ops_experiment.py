@@ -33,6 +33,148 @@ from plot import (
     plot_ops_influence_over_steps,
 )
 
+def _normalize_selection(selection: str) -> str:
+    """Normalize selection aliases."""
+    s = str(selection or "random").strip().lower()
+    if s == "uncertainty":
+        return "ci_uncertainty"
+    return s
+
+def _select_indices_for_operation(
+    operation: str,
+    selection: str,
+    matches_df: pd.DataFrame,
+    chosen_indices: np.ndarray,
+    current_df: pd.DataFrame,
+    elo_curr: pd.Series,
+    batch_size: int,
+    rng: np.random.Generator,
+    target_player: str ,
+) -> np.ndarray:
+    """Shared selector used by both experiment runners."""
+    selection = _normalize_selection(selection)
+    k_eff = max(1, int(batch_size))
+    if operation == "add":
+        chosen_set = set(map(int, chosen_indices.tolist()))
+        pool = np.array([i for i in matches_df.index.values if i not in chosen_set], dtype=int)
+        if pool.size == 0:
+            return np.array([], dtype=int)
+        if selection == "random" or elo_curr is None:
+            k_take = int(min(k_eff, pool.size))
+            return rng.choice(pool, size=k_take, replace=False).astype(int)
+        sub = matches_df.loc[pool]
+        if selection == "ci_uncertainty":
+            scores_ser = compute_ci_uncertainty_per_match(sub, elo_curr)
+            scores = scores_ser.values.astype(float)
+        elif selection == "influence":
+            scores_ser = compute_influence_leverage(sub, elo_curr)
+            scores = scores_ser.values.astype(float)
+        elif selection == "reward":
+            scores_ser = compute_reward_per_match(sub, elo_curr, target_player=None)
+            scores = scores_ser.values.astype(float)
+        elif selection == "target_var_drop":
+            if target_player is None:
+                try:
+                    target_name = pd.Series(elo_curr).sort_values(ascending=False).index[0]
+                except Exception:
+                    target_name = None
+            else:
+                target_name = target_player
+            if target_name is None:
+                scores = np.full(sub.shape[0], np.nan, dtype=float)
+            else:
+                scores_ser = compute_target_variance_drop_per_match(sub, elo_curr, target_name)
+                scores = scores_ser.values.astype(float)
+        else:
+            scores = np.full(sub.shape[0], np.nan, dtype=float)
+        if np.all(np.isnan(scores)):
+            k_take = int(min(k_eff, pool.size))
+            return rng.choice(pool, size=k_take, replace=False).astype(int)
+        order = np.argsort(-np.nan_to_num(scores, nan=-np.inf))
+        k_take = int(min(k_eff, pool.size))
+        return pool[order[:k_take]].astype(int)
+
+    elif operation == "remove":
+        if chosen_indices.size == 0:
+            return np.array([], dtype=int)
+        if selection == "random" or elo_curr is None:
+            k_take = int(min(k_eff, chosen_indices.size))
+            return rng.choice(chosen_indices, size=k_take, replace=False).astype(int)
+        sub = current_df.loc[chosen_indices]
+        if selection == "influence":
+            vals_ser = compute_influence_leverage(sub, elo_curr)
+            vals = vals_ser.values.astype(float)
+        elif selection == "ci_uncertainty":
+            vals_ser = compute_ci_uncertainty_per_match(sub, elo_curr)
+            vals = vals_ser.values.astype(float)
+        elif selection == "reward":
+            vals_ser = compute_reward_per_match(sub, elo_curr, target_player=None)
+            vals = vals_ser.values.astype(float)
+        elif selection == "target_var_drop":
+            if target_player is None:
+                try:
+                    target_name = pd.Series(elo_curr).sort_values(ascending=False).index[0]
+                except Exception:
+                    target_name = None
+            else:
+                target_name = target_player
+            if target_name is None:
+                vals = np.full(sub.shape[0], np.nan, dtype=float)
+            else:
+                vals_ser = compute_target_variance_drop_per_match(sub, elo_curr, target_name)
+                vals = vals_ser.values.astype(float)
+        else:
+            vals = np.full(sub.shape[0], np.nan, dtype=float)
+        if np.all(np.isnan(vals)):
+            k_take = int(min(k_eff, chosen_indices.size))
+            return rng.choice(chosen_indices, size=k_take, replace=False).astype(int)
+        order = np.argsort(-np.nan_to_num(vals, nan=-np.inf))
+        k_take = int(min(k_eff, chosen_indices.size))
+        return chosen_indices[order[:k_take]].astype(int)
+
+    else:  # operation == "flip"
+        eligible_list = []
+        for idx in chosen_indices:
+            w = current_df.loc[int(idx), "winner"]
+            if str(w) in ["model_a", "model_b"]:
+                eligible_list.append(int(idx))
+        eligible = np.array(eligible_list, dtype=int)
+        if eligible.size == 0:
+            return np.array([], dtype=int)
+        if selection == "random" or elo_curr is None:
+            k_take = int(min(k_eff, eligible.size))
+            return rng.choice(eligible, size=k_take, replace=False).astype(int)
+        sub = current_df.loc[eligible]
+        if selection == "influence":
+            vals_ser = compute_influence_leverage(sub, elo_curr)
+            vals = vals_ser.values.astype(float)
+        elif selection == "ci_uncertainty":
+            vals_ser = compute_ci_uncertainty_per_match(sub, elo_curr)
+            vals = vals_ser.values.astype(float)
+        elif selection == "reward":
+            vals_ser = compute_reward_per_match(sub, elo_curr, target_player=None)
+            vals = vals_ser.values.astype(float)
+        elif selection == "target_var_drop":
+            if target_player is None:
+                try:
+                    target_name = pd.Series(elo_curr).sort_values(ascending=False).index[0]
+                except Exception:
+                    target_name = None
+            else:
+                target_name = target_player
+            if target_name is None:
+                vals = np.full(sub.shape[0], np.nan, dtype=float)
+            else:
+                vals_ser = compute_target_variance_drop_per_match(sub, elo_curr, target_name)
+                vals = vals_ser.values.astype(float)
+        else:
+            vals = np.full(sub.shape[0], np.nan, dtype=float)
+        if np.all(np.isnan(vals)):
+            k_take = int(min(k_eff, eligible.size))
+            return rng.choice(eligible, size=k_take, replace=False).astype(int)
+        order = np.argsort(-np.nan_to_num(vals, nan=-np.inf))
+        k_take = int(min(k_eff, eligible.size))
+        return eligible[order[:k_take]].astype(int)
 
 def _compute_influence_map(current_df: pd.DataFrame, elo_series: pd.Series) -> dict:
     """
@@ -96,6 +238,8 @@ def _min_actions_to_change(
     target_player: str = None,
     max_actions: int = 500,
     batch_size: int = 1,
+    matches_df: pd.DataFrame | None = None,
+    players_df: pd.DataFrame | None = None,
 ) -> dict:
     """
     Return dict with number of actions needed to change ranking according to change_mode.
@@ -111,12 +255,14 @@ def _min_actions_to_change(
     assert operation in {"add", "remove", "flip"}
     # support aliases
 
+    selection = _normalize_selection(selection)
     assert selection in {"random", "influence", "ci_uncertainty", "reward", "target_var_drop"}
     assert change_mode in {"any", "player"}
 
-    players_df, matches_df = generate_arena_dataset(
-        num_players=num_players, n_matches=n_matches, gamma=2, seed=seed, allow_ties=True
-    )
+    if matches_df is None or players_df is None:
+        players_df, matches_df = generate_arena_dataset(
+            num_players=num_players, n_matches=n_matches, gamma=2, seed=seed, allow_ties=True
+        )
 
     rng = np.random.default_rng(seed)
 
@@ -368,6 +514,8 @@ def run_min_actions_experiment(
     batch_size: int = 1,
     out_suffix: str = "",
     do_plot: bool = True,
+    matches_df: pd.DataFrame | None = None,
+    players_df: pd.DataFrame | None = None,
 ):
     rows = []
     for sd in seeds:
@@ -381,6 +529,8 @@ def run_min_actions_experiment(
             target_player=target_player,
             max_actions=max_actions,
             batch_size=batch_size,
+            matches_df=matches_df,
+            players_df=players_df,
         )
         rows.append(res)
     df = pd.DataFrame(rows)
@@ -458,8 +608,8 @@ def run_operations_till_end_report(
     num_players: int,
     n_matches: int,
     operation: str,
-    strategy_name: str = "random",
-    steps: int = 20,
+    selection: str = "random",
+    steps: int = 0,
     batch_size: int = 10,
     init_n: int = 30,
     out_suffix: str = "",
@@ -467,15 +617,23 @@ def run_operations_till_end_report(
     reward_K: float = 1.0,
     reward_scale: float = 1.0,
     reward_base: float = math.e,
+    matches_df: pd.DataFrame | None = None,
+    players_df: pd.DataFrame | None = None,
 ):
     assert operation in {"add", "remove", "flip"}
-    players_df, matches_df = generate_arena_dataset(
-        num_players=num_players, n_matches=n_matches, gamma=2, seed=seed, allow_ties=True
-    )
-    true_skills = players_df.set_index('player_name')['skill_level']
+    selection = _normalize_selection(selection)
+
+    if matches_df is None or players_df is None:
+        players_df, matches_df = generate_arena_dataset(
+            num_players=num_players, n_matches=n_matches, gamma=2, seed=seed, allow_ties=True
+        )
+    # true skills available only for synthetic
+    if {'player_name','skill_level'}.issubset(players_df.columns):
+        true_skills = players_df.set_index('player_name')['skill_level']
+    else:
+        true_skills = None
 
     rng = np.random.default_rng(seed)
-    strategy = RandomStrategy() if strategy_name == "random" else RandomStrategy()
 
     # Initialize chosen set and current df
     if operation == "add":
@@ -680,31 +838,48 @@ def run_operations_till_end_report(
     # Baseline before any change
     record_step(step=0, label='baseline', changed_idx=np.array([], dtype=int))
 
-    # Iterative operations
-    for step in range(1, steps + 1):
-        changed = np.array([], dtype=int)
+    # Iterative operations (run to end if steps <= 0)
+    step = 0
+    while True:
+        if steps > 0 and step >= steps:
+            break
+        elo_curr = None
+        try:
+            elo_curr = compute_mle_elo(current_df)
+        except Exception:
+            elo_curr = None
+
+        sel = _select_indices_for_operation(
+            operation=operation,
+            selection=selection,
+            matches_df=matches_df,
+            chosen_indices=chosen_indices,
+            current_df=current_df,
+            elo_curr=elo_curr,
+            batch_size=batch_size,
+            rng=rng,
+            target_player=target_player,
+        )
+        changed = sel
+        if changed.size == 0:
+            break
         if operation == "add":
-            sel, chosen_indices = add_matches_random(matches_df, chosen_indices, batch_size, rng, strategy)
-            if sel.size > 0:
-                current_df = pd.concat([current_df, matches_df.loc[sel]], axis=0)
-                changed = sel
-            else:
-                # No samples left to add → stop; last recorded step already reflects final state
-                break
+            chosen_indices = np.unique(np.concatenate([chosen_indices, changed])).astype(int)
+            current_df = pd.concat([current_df, matches_df.loc[changed]], axis=0)
         elif operation == "remove":
-            sel, chosen_indices = remove_matches_random(chosen_indices, batch_size, rng, strategy)
-            if sel.size > 0:
-                current_df = matches_df.loc[chosen_indices].copy()
-                changed = sel
-            else:
-                # Nothing left to remove → stop
-                break
-        elif operation == "flip":
-            sel, current_df = flip_matches_random(current_df, chosen_indices, batch_size, rng, strategy)
-            changed = sel
-            if sel.size == 0:
-                # No eligible matches to flip (e.g., only ties) → stop
-                break
+            mask_keep = ~np.isin(chosen_indices, changed)
+            chosen_indices = chosen_indices[mask_keep]
+            current_df = matches_df.loc[chosen_indices].copy()
+        else:  # flip
+            for idx in changed:
+                cur_w = current_df.loc[int(idx), "winner"]
+                if str(cur_w) == "model_a":
+                    new_w = "model_b"
+                elif str(cur_w) == "model_b":
+                    new_w = "model_a"
+                else:
+                    new_w = cur_w
+                current_df.loc[int(idx), "winner"] = new_w
 
         # If we cannot fit (e.g., design empty), skip logging for this step
         try:
@@ -712,6 +887,7 @@ def run_operations_till_end_report(
         except Exception:
             continue
 
+        step += 1
         record_step(step=step, label=operation, changed_idx=changed)
 
     # Save all logs
@@ -813,7 +989,7 @@ def main():
         num_players=args.players,
         n_matches=args.matches,
         operation=args.operation,
-        strategy_name=args.strategy,
+        selection=args.selection,
         steps=args.steps,
         batch_size=args.batch,
         init_n=args.init_n,

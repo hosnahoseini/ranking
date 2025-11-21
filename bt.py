@@ -85,7 +85,8 @@ def compute_mle_elo(df, SCALE=1.0, BASE=math.e, INIT_RATING=0.5, sample_weight=N
     if X.shape[0] == 0 or float(W.sum()) == 0:
         raise ValueError("Insufficient pairwise data for BT fit (empty design).")
 
-    lr = LogisticRegression(fit_intercept=False, penalty=None, tol=1e-6)
+    # Increase iterations and set solver to ensure convergence on large datasets
+    lr = LogisticRegression(fit_intercept=False, penalty=None, tol=1e-6, max_iter=2000, solver="lbfgs")
     lr.fit(X, Y, sample_weight=W)
 
     # Work in ξ units (your current convention)

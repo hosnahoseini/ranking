@@ -3,6 +3,7 @@ import sys
 import math
 import pandas as pd
 import numpy as np
+from scipy.special import expit
 import streamlit as st
 import matplotlib.pyplot as plt
 
@@ -11,7 +12,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from dataset import generate_arena_dataset
+from dataset import generate_arena_dataset, load_chatbot_arena_matches, load_arena_hp55k_matches
 from bt import compute_mle_elo, build_bt_design_aggregated
 from evaluate import evaluate_ranking_correlation, compute_sandwich_ci, compute_reward_per_match, compute_ci_uncertainty_per_match, compute_target_variance_drop_per_match
 from plot import plot_ops_ranking_cubes
@@ -41,7 +42,11 @@ def _ensure_session_state_defaults():
 def fit_bt_and_metrics(matches_df: pd.DataFrame, players_df: pd.DataFrame, target_player: str | None, full_matches_df: pd.DataFrame | None = None):
     elo = compute_mle_elo(matches_df)
     sand, _ = compute_sandwich_ci(matches_df, elo)
-    true_skills = players_df.set_index('player_name')['skill_level'] if 'player_name' in players_df.columns else None
+    # True skills only exist for synthetic datasets; arena datasets have no ground truth
+    if {'player_name','skill_level'}.issubset(players_df.columns):
+        true_skills = players_df.set_index('player_name')['skill_level']
+    else:
+        true_skills = None
     reward = compute_reward_per_match(matches_df, elo, target_player)
     influence = compute_influence_leverage(matches_df, elo)
     ci_unc = compute_ci_uncertainty_per_match(matches_df, elo)
@@ -114,15 +119,48 @@ def main():
 
     with st.sidebar:
         st.header("Config")
-        n_players = st.number_input("Players", value=3, min_value=2, step=1)
-        n_matches = st.number_input("Matches", value=15, min_value=10, step=10)
-        seed = st.number_input("Seed", value=1, min_value=0, step=1)
+        dataset_mode = st.radio("Dataset", options=["Synthetic", "Chatbot Arena", "Arena HP55k"], index=0, horizontal=True)
         allow_ties = st.checkbox("Allow ties", value=True)
         target_player = st.text_input("Target player (optional exact name)", value="") or None
-        refresh = st.button("Generate dataset")
+        if dataset_mode == "Synthetic":
+            n_players = st.number_input("Players", value=3, min_value=2, step=1)
+            n_matches = st.number_input("Matches", value=15, min_value=10, step=10)
+            seed = st.number_input("Seed", value=1, min_value=0, step=1)
+        elif dataset_mode == "Chatbot Arena":
+            hf_name = st.text_input("HF dataset", value="lmsys/chatbot_arena_conversations")
+            hf_split = st.text_input("Split", value="train")
+            max_rows = st.number_input("Max rows", value=2000, min_value=100, step=100)
+        else:
+            hf_name = st.text_input("HF dataset", value="lmarena-ai/arena-human-preference-55k")
+            hf_split = st.text_input("Split", value="train")
+            max_rows = st.number_input("Max rows", value=20000, min_value=100, step=100)
+        refresh = st.button("Load dataset")
 
     if st.session_state.players_df is None or refresh:
-        players_df, matches_df = generate_arena_dataset(num_players=int(n_players), n_matches=int(n_matches), gamma=2, seed=int(seed), allow_ties=allow_ties)
+        if dataset_mode == "Synthetic":
+            players_df, matches_df = generate_arena_dataset(
+                num_players=int(n_players), n_matches=int(n_matches), gamma=2, seed=int(seed), allow_ties=allow_ties
+            )
+        elif dataset_mode == "Chatbot Arena":
+            try:
+                matches_df = load_chatbot_arena_matches(
+                    split=hf_split, hf_dataset_name=hf_name, allow_ties=allow_ties, max_rows=int(max_rows)
+                )
+            except Exception as e:
+                st.error(f"Failed to load Chatbot Arena data: {e}")
+                matches_df = pd.DataFrame(columns=['model_a','model_b','winner'])
+            models = sorted(set(matches_df.get('model_a', pd.Series()).astype(str)) | set(matches_df.get('model_b', pd.Series()).astype(str)))
+            players_df = pd.DataFrame({'player_name': models})
+        else:
+            try:
+                matches_df = load_arena_hp55k_matches(
+                    split=hf_split, hf_dataset_name=hf_name, allow_ties=allow_ties, max_rows=int(max_rows)
+                )
+            except Exception as e:
+                st.error(f"Failed to load Arena HP55k data: {e}")
+                matches_df = pd.DataFrame(columns=['model_a','model_b','winner'])
+            models = sorted(set(matches_df.get('model_a', pd.Series()).astype(str)) | set(matches_df.get('model_b', pd.Series()).astype(str)))
+            players_df = pd.DataFrame({'player_name': models})
         st.session_state.players_df = players_df
         st.session_state.matches_df = matches_df
         st.session_state.subset_indices = matches_df.index.tolist()  # default all selected
@@ -130,6 +168,7 @@ def main():
         base_elo, _, _, _, _, _, _, _ = fit_bt_and_metrics(matches_df, players_df, target_player=None, full_matches_df=matches_df)
         st.session_state.base_elo = base_elo
         st.session_state.target_player = target_player
+        st.session_state.dataset_mode = dataset_mode
 
     players_df = st.session_state.players_df
     matches_df = st.session_state.matches_df
@@ -140,18 +179,71 @@ def main():
 
     # --- Players table (top) ---
     col_players.subheader("Players")
-    true_skills = players_df.set_index('player_name')['skill_level']
+    # True skills only exist for synthetic dataset
+    if {'player_name','skill_level'}.issubset(players_df.columns):
+        true_skills = players_df.set_index('player_name')['skill_level']
+    else:
+        true_skills = None
     if st.session_state.has_fit and st.session_state.history:
         last = st.session_state.history[-1]
         tbl_players = build_players_table(last['elo'], last['ci'], true_skills)
         col_players.dataframe(tbl_players.style.background_gradient(subset=['pred_skill'], cmap='Blues'), use_container_width=True)
     else:
         # Before first fit: show all columns with NaN where not applicable
-        empty = pd.DataFrame({'player': true_skills.index, 'true_skill': true_skills.values})
-        empty['true_rank'] = true_skills.rank(ascending=False, method='min').values
+        if true_skills is not None:
+            empty = pd.DataFrame({'player': true_skills.index, 'true_skill': true_skills.values})
+            empty['true_rank'] = true_skills.rank(ascending=False, method='min').values
+        else:
+            base_players = list(players_df['player_name']) if 'player_name' in players_df.columns else []
+            empty = pd.DataFrame({'player': base_players, 'true_skill': np.nan})
+            empty['true_rank'] = np.nan
         empty['pred_skill'] = np.nan; empty['pred_rank'] = np.nan
         empty['ci_width'] = np.nan
         col_players.dataframe(empty, use_container_width=True)
+
+    try:
+        # Probability matrix: prefer ground-truth skills if available, else use current/base elo
+        if true_skills is not None and len(true_skills) > 0:
+            players_list = list(true_skills.index)
+            ratings = true_skills.values.astype(float)
+        else:
+            # Use latest fitted elo if available, else base elo
+            if st.session_state.has_fit and st.session_state.history:
+                elo_for_probs = st.session_state.history[-1].get('elo', st.session_state.base_elo)
+            else:
+                elo_for_probs = st.session_state.base_elo
+            if isinstance(elo_for_probs, pd.Series):
+                players_list = list(elo_for_probs.index)
+                ratings = elo_for_probs.loc[players_list].astype(float).values
+            else:
+                players_list, ratings = [], np.array([])
+        if len(players_list) > 0:
+            diff = ratings[:, None] - ratings[None, :]
+            prob_mat = 1 / (1 + np.exp(-diff))
+            prob_df = pd.DataFrame(prob_mat, index=players_list, columns=players_list)
+            np.fill_diagonal(prob_df.values, np.nan)
+            col_players.subheader("BT win probability matrix P(i beats j)")
+            col_players.dataframe(prob_df.style.format("{:.3f}").background_gradient(cmap='Blues'), use_container_width=True)
+            # Win counts matrix: # times i beat j (ties excluded)
+            try:
+                wins_ab = pd.pivot_table(
+                    matches_df[matches_df['winner'] == 'model_a'],
+                    index='model_a', columns='model_b', aggfunc='size', fill_value=0
+                )
+                wins_ba = pd.pivot_table(
+                    matches_df[matches_df['winner'] == 'model_b'],
+                    index='model_b', columns='model_a', aggfunc='size', fill_value=0
+                )
+                wins_ab = wins_ab.reindex(index=players_list, columns=players_list, fill_value=0)
+                wins_ba = wins_ba.reindex(index=players_list, columns=players_list, fill_value=0)
+                wins_mat = wins_ab.add(wins_ba, fill_value=0).astype(int)
+                np.fill_diagonal(wins_mat.values, 0)
+                col_players.subheader("Win counts matrix # wins(i over j)")
+                col_players.dataframe(wins_mat.style.format("{:d}").background_gradient(cmap='Greens'), use_container_width=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     st.markdown("---")
 
@@ -166,6 +258,11 @@ def main():
         last_ci_unc = last.get('ci_uncertainty')
         last_tvd = last.get('target_var_drop')
     df_matches_view = matches_df.copy().reset_index().rename(columns={'index':'match_index'})
+    # Ensure numeric sort for match_index (avoid lexicographic behavior)
+    try:
+        df_matches_view['match_index'] = pd.to_numeric(df_matches_view['match_index'], errors='coerce')
+    except Exception:
+        pass
     # Always include metric columns; fill with NaN before first fit
     df_matches_view['reward'] = last_reward.reindex(matches_df.index).values if last_reward is not None else np.nan
     df_matches_view['influence'] = last_infl.reindex(matches_df.index).values if last_infl is not None else np.nan
@@ -173,12 +270,14 @@ def main():
     df_matches_view['target_var_drop'] = last_tvd.reindex(matches_df.index).values if last_tvd is not None else np.nan
 
     # Sorting and batch selection controls
-    sort_options = [c for c in ['reward','influence','ci_uncertainty','target_var_drop','model_a','model_b','winner'] if c in df_matches_view.columns]
+    sort_options = [c for c in df_matches_view.columns]
     if not sort_options:
-        sort_options = ['model_a','model_b','winner']
+        sort_options = ['match_index','model_a','model_b','winner']
     col_sort, col_asc, col_range = col_matches.columns([1,1,2])
-    sort_col = col_sort.selectbox("Sort by", options=sort_options, index=0)
-    ascending = col_asc.checkbox("Ascending", value=False)
+    # Default to 'reward' if available, else first option
+    default_sort_index = sort_options.index('match_index')
+    sort_col = col_sort.selectbox("Sort by", options=sort_options, index=default_sort_index)
+    ascending = col_asc.checkbox("Ascending", value=True)
     df_sorted = df_matches_view.sort_values(sort_col, ascending=ascending, na_position='last')
     r = col_range.slider("Range (by row index in sorted table)", min_value=0, max_value=max(0, len(df_sorted)-1), value=(0, min(len(df_sorted)-1, 19)))
     cr_sel, cr_fit = col_range.columns([1,1])
@@ -341,34 +440,7 @@ def main():
             c2.pyplot(fig2, clear_figure=True)
         except Exception:
             pass
-        # Mean CI-based uncertainty
-        # try:
-        #     fig3, ax3 = plt.subplots(figsize=(6.0, 3.0))
-        #     steps = dfm['step'].values.astype(int)
-        #     n_list = dfm['n_matches'].values
-        #     ax3.plot(steps, dfm['mean_ci_uncertainty'].values, '-o', color='#33a02c')
-        #     ax3.set_xticks(steps)
-        #     ax3.set_xticklabels([f"{s} ({int(n) if not pd.isna(n) else 'NA'})" for s, n in zip(steps, n_list)])
-        #     ax3.set_xlabel('Update step (n_matches)')
-        #     ax3.set_ylabel('Mean CI-based uncertainty')
-        #     ax3.grid(True, alpha=0.3)
-        #     c2.pyplot(fig3, clear_figure=True)
-        # except Exception:
-        #     pass
-        # Mean target-specific variance drop
-        # try:
-        #     fig4, ax4 = plt.subplots(figsize=(6.0, 3.0))
-        #     steps = dfm['step'].values.astype(int)
-        #     n_list = dfm['n_matches'].values
-        #     ax4.plot(steps, dfm['mean_target_var_drop'].values, '-o', color='#ff7f00')
-        #     ax4.set_xticks(steps)
-        #     ax4.set_xticklabels([f"{s} ({int(n) if not pd.isna(n) else 'NA'})" for s, n in zip(steps, n_list)])
-        #     ax4.set_xlabel('Update step (n_matches)')
-        #     ax4.set_ylabel('Mean target variance drop')
-        #     ax4.grid(True, alpha=0.3)
-        #     c2.pyplot(fig4, clear_figure=True)
-        # except Exception:
-        #     pass
+
 
         # Ranking cube plot using history
         try:
@@ -545,37 +617,6 @@ def main():
             ax.legend(fontsize=8, ncol=2, title='match')
             right_plot.pyplot(fig, clear_figure=True)
 
-    # Plots using history
-    # if st.session_state.history:
-    #     st.markdown("---")
-    #     st.subheader("Evolution (history)")
-    #     hist = st.session_state.history
-    #     dfm = pd.DataFrame([
-    #         {
-    #             'step': h['step'],
-    #             'n_matches': h['n_matches'],
-    #             'spearman': h.get('spearman', np.nan),
-    #             'kendall': h.get('kendall', np.nan),
-    #             'mean_ci_width': (h['ci']['upper'] - h['ci']['lower']).mean() if isinstance(h.get('ci'), pd.DataFrame) else np.nan,
-    #             'mean_reward': float(h['reward'].mean()) if isinstance(h.get('reward'), pd.Series) else np.nan,
-    #             'mean_influence': float(h['influence'].mean()) if isinstance(h.get('influence'), pd.Series) else np.nan,
-    #         }
-    #         for h in hist
-    #     ]).sort_values('step')
-    #     st.line_chart(dfm.set_index('step')[['spearman','kendall','mean_ci_width','mean_reward','mean_influence']].dropna(how='all', axis=1))
-
-    #     # Ranking cube plot using history
-    #     try:
-    #         rankings_rows = []
-    #         for h in hist:
-    #             for m, r in h['elo'].items():
-    #                 rankings_rows.append({'step': h['step'], 'model': m, 'rating': float(r)})
-    #         rankings_df = pd.DataFrame(rankings_rows)
-    #         ci_concat = pd.concat([h['ci'] for h in hist if isinstance(h.get('ci'), pd.DataFrame)], ignore_index=True)
-    #         plot_ops_ranking_cubes(rankings_df, ci_concat, events_df=None, operation="interactive", true_skills=true_skills, save_path=None)
-    #         st.pyplot(plt.gcf(), clear_figure=True)
-    #     except Exception:
-    #         pass
 
 
 if __name__ == "__main__":
