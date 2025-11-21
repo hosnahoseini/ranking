@@ -8,16 +8,15 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 # Ensure project root is on sys.path so imports work when running from interactive_ui/
-# ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-# if ROOT not in sys.path:
-#     sys.path.insert(0, ROOT)
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
+from ranking_dataset import generate_arena_dataset, load_chatbot_arena_matches, load_arena_hp55k_matches
 from bt import compute_mle_elo, build_bt_design_aggregated
 from evaluate import evaluate_ranking_correlation, compute_sandwich_ci, compute_reward_per_match, compute_ci_uncertainty_per_match, compute_target_variance_drop_per_match
 from plot import plot_ops_ranking_cubes
 from influence import compute_influence_leverage
-from dataset import generate_arena_dataset, load_chatbot_arena_matches, load_arena_hp55k_matches
-
 
 st.set_page_config(page_title="BT Arena Interactive", layout="wide")
 
